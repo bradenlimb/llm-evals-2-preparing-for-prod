@@ -69,6 +69,12 @@ This project uses [uv](https://docs.astral.sh/uv/) for Python package management
 
 ### Running the Application
 
+Chat history is stored in Redis. Start a Redis container on port 6380 (port 6379 is used by Langfuse's own Redis) and set `REDIS_URL=redis://localhost:6380/0` in `.env`:
+
+```bash
+docker run --restart always --name hyper-redis -d -p 6380:6379 redis redis-server --save 60 1
+```
+
 The prompts are stored in Langfuse prompt management, so create them in your Langfuse project once before the first run (each rerun adds a new version and moves the `production` label to it):
 
 ```bash
@@ -81,7 +87,7 @@ Then start the chatbot:
 uv run python main.py
 ```
 
-Run the tests (they run offline and need no API keys):
+Run the tests (they need no API keys; the Redis tests are skipped if Redis is not running):
 
 ```bash
 uv run pytest
@@ -166,6 +172,7 @@ Here are the main directories and files in this repo:
 ├── scripts/
 │   └── create_langfuse_prompts.py   # uploads the chatbot prompts to Langfuse
 ├── tests/
+│   ├── test_chat_history.py         # tests for Redis history and trimming
 │   └── test_prompts.py              # offline tests for prompt loading
 ├── tasks/
 │   ├── task_1.md
@@ -174,6 +181,7 @@ Here are the main directories and files in this repo:
 │   └── task_4.md
 ├── .env.sample
 ├── .gitignore
+├── chat_history.py                  # Redis chat history, TTL and trimming
 ├── main.py
 ├── prompts.py                       # loads versioned prompts from Langfuse
 ├── pyproject.toml
