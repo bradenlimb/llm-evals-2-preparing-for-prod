@@ -143,16 +143,12 @@ live = pytest.mark.skipif(os.getenv("RUN_LIVE_TESTS") != "1", reason="set RUN_LI
 
 @pytest.fixture(scope="module")
 def live_rails():
-    """Guardrails engine using the chat model configured in .env."""
-    from langchain_openai import ChatOpenAI
+    """Guardrails engine using the app's chat model through the LiteLLM proxy."""
+    from llm_clients import create_chat_model
 
     dotenv.load_dotenv()
-    guardrails_llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL"),
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        api_key=os.getenv("OPENAI_API_KEY"),
-        temperature=0,
-    )
+    # Temperature 0 keeps the Yes/No classification as repeatable as possible
+    guardrails_llm = create_chat_model("live-tests").model_copy(update={"temperature": 0})
     return load_input_rails(guardrails_llm)
 
 

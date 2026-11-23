@@ -8,7 +8,6 @@ import dotenv
 from langchain_community.docstore.document import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams
@@ -17,6 +16,13 @@ from langfuse.langchain import CallbackHandler
 
 from chat_history import build_trimmer, create_chat_history, save_turn
 from input_guardrails import check_input, load_input_rails
+from llm_clients import (
+    DEMO_USERS,
+    create_chat_model,
+    create_embeddings_model,
+    get_key_spend,
+    proxy_error_message,
+)
 from prompts import (
     CONTEXT_PROMPT_NAME,
     GOODBYE_PROMPT_NAME,
@@ -30,23 +36,13 @@ dotenv.load_dotenv()
 
 # Generate unique session_id and user_id once
 session_id = f"session-{uuid.uuid4().hex[:8]}"
-users = ["James", "George", "Mike", "Sherlock"]
-user_id = users[uuid.uuid4().int % len(users)]
+user_id = DEMO_USERS[uuid.uuid4().int % len(DEMO_USERS)]
 
-# Initialize the LLM with OpenAI API credentials (substitute for other models)
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY")
-)
-
-# Initialize the embeddings model with OpenAI API credentials
-embeddings_model = OpenAIEmbeddings(
-    model=os.getenv("OPENAI_EMBEDDINGS_MODEL"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
-    show_progress_bar=True
-)
+# Chat and embeddings clients call the LiteLLM proxy with the app's virtual key
+# (LITELLM_API_KEY), never the provider key. Every request is tagged with
+# user_id so the proxy applies that user's budget and tracks their spend.
+llm = create_chat_model(user_id)
+embeddings_model = create_embeddings_model(user_id)
 
 # Redis connection for chat history. The default matches the task's Docker setup
 # (port 6380, because Langfuse's own Redis uses 6379).
@@ -221,6 +217,18 @@ def generate_context(ai_message: AIMessage, conversation: list) -> list:
     return conversation
 
 
+def print_usage() -> None:
+    """
+    Print how much the app's LiteLLM virtual key has spent in its current budget period.
+
+    :returns
+        None. Prints the spend [USD], or nothing if the proxy did not report it.
+    """
+    key_spend = get_key_spend()
+    if key_spend is not None:
+        print(f"Usage so far on this API key: ${key_spend:.6f}")
+
+
 # ---------------------------
 # Main Conversation Loop
 # ---------------------------
@@ -259,12 +267,9 @@ def main():
     # Input guardrails (config/config.yml and config/prompts.yml). They get
     # their own copy of the chat model with the Langfuse handler attached, so
     # each self-check call is traced under the user-query span.
-    guardrails_llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL"),
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        api_key=os.getenv("OPENAI_API_KEY"),
-        callbacks=[langfuse_handler],
-    )
+    # The guardrail checks also go through the proxy and count toward the
+    # user's budget.
+    guardrails_llm = create_chat_model(user_id, callbacks=[langfuse_handler])
     input_rails = load_input_rails(guardrails_llm)
 
     try:
@@ -322,56 +327,75 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
-                    # Check the message against the input rails before any
-                    # chain runs. A blocked message costs one short
-                    # classification call and is never saved to Redis.
-                    input_check = check_input(input_rails, user_input)
+                    try:
+                        # Check the message against the input rails before any
+                        # chain runs. A blocked message costs one short
+                        # classification call and is never saved to Redis.
+                        input_check = check_input(input_rails, user_input)
 
-                    if input_check.blocked:
-                        # Record the block on the span so filtered inputs can be
-                        # reviewed in Langfuse (filter on level WARNING)
-                        span.update(
-                            output={"response": input_check.bot_message},
-                            level="WARNING",
-                            status_message=f"Blocked by input rail: {input_check.triggered_rail}",
-                            metadata={"guardrail_blocked": True, "triggered_rail": input_check.triggered_rail},
+                        if input_check.blocked:
+                            # Record the block on the span so filtered inputs can be
+                            # reviewed in Langfuse (filter on level WARNING)
+                            span.update(
+                                output={"response": input_check.bot_message},
+                                level="WARNING",
+                                status_message=f"Blocked by input rail: {input_check.triggered_rail}",
+                                metadata={"guardrail_blocked": True, "triggered_rail": input_check.triggered_rail},
+                            )
+                            print(f"System: {input_check.bot_message}")
+                            print_usage()
+                            continue  # skip the chains and the Redis save
+
+                        # Build this turn's in-memory conversation: the saved history
+                        # from Redis plus the user's new message. Tool calls and tool
+                        # results are added during the turn but never saved to Redis.
+                        conversation = list(redis_history.messages)
+                        user_message = HumanMessage(user_input)
+                        conversation.append(user_message)
+
+                        # Context chain: decide which smartphones to look up
+                        tool_call_message = context_chain.invoke(
+                            {"user_input": user_input, "conversation": conversation},
+                            config={
+                                "run_name": "context",
+                                "callbacks": [langfuse_handler]
+                            }
                         )
-                        print(f"System: {input_check.bot_message}")
-                        continue  # skip the chains and the Redis save
 
-                    # Build this turn's in-memory conversation: the saved history
-                    # from Redis plus the user's new message. Tool calls and tool
-                    # results are added during the turn but never saved to Redis.
-                    conversation = list(redis_history.messages)
-                    user_message = HumanMessage(user_input)
-                    conversation.append(user_message)
+                        # Run the requested tool calls and add their results to
+                        # this turn's conversation for the review chain to use
+                        generate_context(tool_call_message, conversation)
 
-                    # Context chain: decide which smartphones to look up
-                    tool_call_message = context_chain.invoke(
-                        {"user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "context",
-                            "callbacks": [langfuse_handler]
-                        }
-                    )
+                        # Final response chain invocation
+                        response = review_chain.invoke(
+                            {"user_id": user_id, "user_input": user_input, "conversation": conversation},
+                            config={
+                                "run_name": "final-response",
+                                "callbacks": [langfuse_handler]
+                            }
+                        )
 
-                    # Run the requested tool calls and add their results to
-                    # this turn's conversation for the review chain to use
-                    generate_context(tool_call_message, conversation)
-
-                    # Final response chain invocation
-                    response = review_chain.invoke(
-                        {"user_id": user_id, "user_input": user_input, "conversation": conversation},
-                        config={
-                            "run_name": "final-response",
-                            "callbacks": [langfuse_handler]
-                        }
-                    )
+                    except Exception as turn_error:
+                        # The proxy rejects calls once a budget or rate limit is
+                        # hit. Tell the user and keep the session open; any
+                        # other error is unexpected and ends the program.
+                        rejection = proxy_error_message(turn_error)
+                        if rejection is None:
+                            raise
+                        span.update(
+                            output={"response": rejection},
+                            level="WARNING",
+                            status_message=f"Rejected by LiteLLM proxy: {turn_error}",
+                            metadata={"proxy_rejected": True},
+                        )
+                        print(f"System: {rejection}")
+                        continue  # nothing to save for a rejected turn
 
                 # Set the output on the parent span
                 span.update(output={"response": response.content}, metadata={"guardrail_blocked": False})
 
             print(f"System: {response.content}")
+            print_usage()
 
             # Persist only the user's message and the final reply to Redis
             save_turn(redis_history, user_message, response)
