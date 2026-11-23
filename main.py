@@ -16,6 +16,7 @@ from langfuse import observe, propagate_attributes, get_client
 from langfuse.langchain import CallbackHandler
 
 from chat_history import build_trimmer, create_chat_history, save_turn
+from input_guardrails import check_input, load_input_rails
 from prompts import (
     CONTEXT_PROMPT_NAME,
     GOODBYE_PROMPT_NAME,
@@ -255,6 +256,17 @@ def main():
     # Initialize the Langfuse handler once for the entire conversation
     langfuse_handler = CallbackHandler()
 
+    # Input guardrails (config/config.yml and config/prompts.yml). They get
+    # their own copy of the chat model with the Langfuse handler attached, so
+    # each self-check call is traced under the user-query span.
+    guardrails_llm = ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL"),
+        base_url=os.getenv("OPENAI_BASE_URL"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        callbacks=[langfuse_handler],
+    )
+    input_rails = load_input_rails(guardrails_llm)
+
     try:
         print("Welcome to the Smartphone Assistant! I can help you with smartphone features and comparisons.")
         while True:
@@ -299,13 +311,6 @@ def main():
                 print("\nThank you for your feedback!")
                 break
 
-            # Build this turn's in-memory conversation: the saved history from
-            # Redis plus the user's new message. Tool calls and tool results are
-            # added to this list during the turn but never saved to Redis.
-            conversation = list(redis_history.messages)
-            user_message = HumanMessage(user_input)
-            conversation.append(user_message)
-
             # Create a parent span for this user query to group all chain invocations
             with langfuse.start_as_current_observation(
                 as_type="span",
@@ -317,6 +322,30 @@ def main():
                     session_id=session_id,
                     user_id=user_id
                 ):
+                    # Check the message against the input rails before any
+                    # chain runs. A blocked message costs one short
+                    # classification call and is never saved to Redis.
+                    input_check = check_input(input_rails, user_input)
+
+                    if input_check.blocked:
+                        # Record the block on the span so filtered inputs can be
+                        # reviewed in Langfuse (filter on level WARNING)
+                        span.update(
+                            output={"response": input_check.bot_message},
+                            level="WARNING",
+                            status_message=f"Blocked by input rail: {input_check.triggered_rail}",
+                            metadata={"guardrail_blocked": True, "triggered_rail": input_check.triggered_rail},
+                        )
+                        print(f"System: {input_check.bot_message}")
+                        continue  # skip the chains and the Redis save
+
+                    # Build this turn's in-memory conversation: the saved history
+                    # from Redis plus the user's new message. Tool calls and tool
+                    # results are added during the turn but never saved to Redis.
+                    conversation = list(redis_history.messages)
+                    user_message = HumanMessage(user_input)
+                    conversation.append(user_message)
+
                     # Context chain: decide which smartphones to look up
                     tool_call_message = context_chain.invoke(
                         {"user_input": user_input, "conversation": conversation},
@@ -340,7 +369,7 @@ def main():
                     )
 
                 # Set the output on the parent span
-                span.update(output={"response": response.content})
+                span.update(output={"response": response.content}, metadata={"guardrail_blocked": False})
 
             print(f"System: {response.content}")
 

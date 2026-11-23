@@ -93,6 +93,14 @@ Run the tests (they need no API keys; the Redis tests are skipped if Redis is no
 uv run pytest
 ```
 
+Also run the live guardrail tests, which send a few example messages to the model configured in `.env`:
+
+```bash
+RUN_LIVE_TESTS=1 uv run pytest tests/test_input_guardrails.py
+```
+
+User input is checked by NeMo Guardrails (`config/config.yml`, `config/prompts.yml`) before any chain runs. Blocked messages get a refusal, are not saved to chat history, and appear in Langfuse as `user-query` traces with level `WARNING`.
+
 If your IDE (VS Code, PyCharm) isn't recognizing the environment or you need to use tools that aren't uv-aware, activate the virtual environment manually:
 ```bash
 source .venv/bin/activate  # On macOS/Linux
@@ -167,12 +175,16 @@ Here are the main directories and files in this repo:
 │       ├── prompt_metrics.png
 │       ├── prompt_observations.png
 │       └── prompts_playground.png
+├── config/
+│   ├── config.yml                   # NeMo Guardrails: input rail and instructions
+│   └── prompts.yml                  # self check input prompt
 ├── datasets/
 │   └── smartphones.json
 ├── scripts/
 │   └── create_langfuse_prompts.py   # uploads the chatbot prompts to Langfuse
 ├── tests/
 │   ├── test_chat_history.py         # tests for Redis history and trimming
+│   ├── test_input_guardrails.py     # guardrail tests (live ones opt-in)
 │   └── test_prompts.py              # offline tests for prompt loading
 ├── tasks/
 │   ├── task_1.md
@@ -182,6 +194,7 @@ Here are the main directories and files in this repo:
 ├── .env.sample
 ├── .gitignore
 ├── chat_history.py                  # Redis chat history, TTL and trimming
+├── input_guardrails.py              # checks user input with NeMo Guardrails
 ├── main.py
 ├── prompts.py                       # loads versioned prompts from Langfuse
 ├── pyproject.toml
